@@ -7,7 +7,7 @@
 # MAGIC 
 # MAGIC __Input__: Two csv files representing nodes and edges (/zenegraph/bikg-sources/hetio_nodes.csv and /zenegraph/bikg-sources/hetio_edges.csv)
 # MAGIC 
-# MAGIC __Output__: ? not clear yet...
+# MAGIC __Output__: Dataframe with three columns: start_node, end_node and DWPC
 
 # COMMAND ----------
 
@@ -18,8 +18,8 @@ from functools import reduce
 import pandas as pd
 import itertools
 import copy
-#from pyspark.sql.functions import array, udf
-#from pyspark.sql.types import ArrayType, StringType, IntegerType
+
+from pyspark.sql.functions import col
 
 # COMMAND ----------
 
@@ -63,9 +63,9 @@ edges_original.count()
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Step 1: Create bi-directional edges
+# MAGIC ## Step 1: Create bi-directional edges
 # MAGIC 
-# MAGIC In the original het.io graph, each edge represents a bidrectional relationship. GraphFrames does not accept undirected relationships so it thinks that each edge I have put in the edges dataframe, is a directed one. I will add the opposite edge to the dataframe so that I can then calculate paths. Or will this mess it up?!?!
+# MAGIC In the original het.io graph, each edge represents a bidrectional relationship. GraphFrames does not accept undirected relationships so it thinks that each edge I have put in the edges dataframe, is a directed one. I will add the opposite edge to the dataframe so that I can then calculate paths. 
 
 # COMMAND ----------
 
@@ -84,7 +84,7 @@ edges.count()
 
 # MAGIC %md
 # MAGIC 
-# MAGIC ### Step 2: Create the graph
+# MAGIC ## Step 2: Create the graph
 # MAGIC 
 # MAGIC Using the original nodes, and the updated edges (to imitate an undirected graph)
 
@@ -98,73 +98,95 @@ print(g)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC 
-# MAGIC Calculate all inDegrees - This should correspond to the number of degrees in the original het.io graph (recall that I have added extra degrees to be able to calculate the metapaths)
-
-# COMMAND ----------
-
-node_degrees = g.inDegrees
-node_degrees.show()
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Find a metapath
+# MAGIC ## Step 3: Find a metapath
 # MAGIC 
 # MAGIC 1. Select a metapath: Compound-[binds]-(Gene)-[associated]-(Disease)
 # MAGIC 2. Select a compound/disease pair: bupropion (DB01156)/nicotine dependence (DOID:0050742)
 # MAGIC 2. Calculate all paths through that metapath for the specific pair
 # MAGIC 3. Calculate DWPC
+# MAGIC 
+# MAGIC   3.1. Select the columns with '\_node' as a suffix
+# MAGIC   
+# MAGIC   3.2. Extract 'id' from each column and replace current content with only this 'id'
+# MAGIC   
+# MAGIC   3.3. Get the node degrees (based on the node 'id') and multiply these degrees by 1**-0.4 (as per the rephetio analysis)
+# MAGIC   
+# MAGIC   3.4. Create a new column as the sum of all columns, call this column 'pdp'
+# MAGIC   
+# MAGIC   3.5. Collapse or groupby 'start_node' and 'end_node' and sum (pdp) -> this is the DWPC for the specific metapath and start/end nodes
 
 # COMMAND ----------
 
-def metapaths_of_length_2(origin_node, r1_type, middle_node, r2_type, destination_node):
-  motifs = g.find("(a)-[r1]->(b); (b)-[r2]->(c)") 
-  metapaths_df = motifs.filter("a.identifier ='"+origin_node+"' and r1.edge_type = '"+r1_type+"' and b.entity_type='"+middle_node+"' and r2.edge_type='"+r2_type+"' and c.identifier='"+destination_node+"'")
+# MAGIC %md
+# MAGIC Helper functions below
+# MAGIC 1. metapaths_of_length_2 takes as input the elements along the path and returns a dataframe where each row represents a path along that metapath
+# MAGIC 2. column_add takes as input two columns and returns their sum
+
+# COMMAND ----------
+
+# helper functions/dataframes
+
+# this function calculated the paths along the specific metapath and returns them in a dataframe
+def metapaths_of_length_2(start_node, r1, middle_node, r2, end_node):
+  motifs = g.find("(start_node)-[r1]->(middle_node); (middle_node)-[r2]->(end_node)") 
+  metapaths_df = motifs.filter("start_node.identifier ='{}' and r1.edge_type = '{}' and middle_node.entity_type='{}' and r2.edge_type='{}' and end_node.identifier='{}'".format(start_node, r1, middle_node, r2, end_node))
   return metapaths_df
 
-# COMMAND ----------
-
-mp_2 = metapaths_of_length_2('DB01156', 'binds', 'Gene', 'associates', 'DOID:0050742')
-display(mp_2)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC I now need to extract the node ids from the dataframe mp_2
-
-# COMMAND ----------
-
-
-
-# COMMAND ----------
-
-temp = mp_2.select('a').collect()
-
-# COMMAND ----------
-
-temp.id
+# this function is for when I want to add all the columns for the pdp
+def column_add(a,b):
+     return  a.__add__(b) 
+  
+# dataframe of in-degrees - this should correspond to the original het.io degrees for each node
+node_degrees = g.inDegrees
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC Calculating the number of edge types
+# MAGIC DWPC function, returns dataframe with DWPC for specified compound/disease pair and specific metapath
 
 # COMMAND ----------
 
-# Find chains of 4 vertices.
-chain4 = g.find("(a)-[ab]->(b); (b)-[bc]->(c); (c)-[cd]->(d)")
+# this function takes as input a dataframe th specified metapath (each element of the metapath is an input) along with a dataframe of the in-degrees of each node
 
-# Query on sequence, with state (cnt)
-#  (a) Define method for updating state given the next element of the motif.
-def path_degree_products(node):
-  g.degrees.filter('node')
-  return when(relationship == "friend", cnt + 1).otherwise(cnt)
+def dwpc_2(start_node, r1, middle_node, r2, end_node, degrees_df):
+  
+  # step 0: calculate metapath dataframe  
+  df = metapaths_of_length_2(start_node, r1, middle_node, r2, end_node)
+  
+  # step 1: keep node columns
+  condition = lambda col: '_node' not in col
+  df = df.drop(*filter(condition, df.columns))
+  
+  # step 2: only keep 'id' value in each column
+  for c in df.columns:
+    df = df.withColumn(c, col(c).getField('id'))
+  
+  # step 3: Get the degrees and multiply by 1**-0.4. Probably a much better way of doing this... 
+  columns = df.columns
+  for c in columns:
+    temp1 = df.withColumnRenamed(c, 'id')
+    temp2 = temp1.join(node_degrees, 'id')
+    temp3 = temp2.withColumnRenamed('inDegree', c).drop('id').withColumn(c, col(c)**-0.4) 
+    df = temp3
 
-#  (b) Use sequence operation to apply method to sequence of elements in motif.
-#   In this case, the elements are the 3 edges.
-edges = ["ab", "bc", "cd"]
-numFriends = reduce(cumFriends, edges, lit(0))
-    
-chainWith2Friends2 = chain4.withColumn("num_friends", numFriends).where(numFriends >= 2)
-display(chainWith2Friends2)
+  # step 4: sum all the columns to obtain the pdp
+  pdp_df = df.withColumn('pdp', reduce(column_add, (df[col] for col in df.columns)))
+  
+  # step 5: replace start_node and end_node columns with their appropriate ids
+  pdp_df = pdp_df.withColumn('start_node', lit(start_node)).withColumn('end_node', lit(end_node))
+  
+  # step 6: group by start_node and end_node to obtain DWPC
+  dwpc_df = pdp_df.groupby(['start_node', 'end_node']).agg({'pdp':'sum'}).withColumnRenamed('sum(pdp)', 'dwpc')
+  
+  return dwpc_df
+
+# COMMAND ----------
+
+dwpc_2('DB01156', 'binds', 'Gene', 'associates', 'DOID:0050742', node_degrees).show()
+
+# COMMAND ----------
+
+
+
+# COMMAND ----------
+
