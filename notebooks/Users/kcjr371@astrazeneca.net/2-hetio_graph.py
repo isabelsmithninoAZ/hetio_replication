@@ -57,6 +57,20 @@ edges_original.count()
 
 # COMMAND ----------
 
+# The number of unique compounds in the graph
+nodes.filter("entity_type = 'Compound'").select(col('identifier')).count()
+
+# COMMAND ----------
+
+# The number of unique diseases in the graph
+nodes.filter("entity_type = 'Disease'").select(col('identifier')).count()
+
+# COMMAND ----------
+
+1552*137
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC # Het.io graph
 
@@ -98,11 +112,39 @@ print(g)
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC The following extracts all the metapaths of length 3 for a specified compound/disease pair
+
+# COMMAND ----------
+
+g_original = GraphFrame(nodes, edges_original)
+
+# metapaths of length 2
+metapath = g_original.find("(c)-[r1]->(n1); (n1)-[r2]->(d)")
+
+# filter for the specific compound and disease
+metapath_filter = metapath.filter("c.identifier ='{}' and d.identifier='{}'".format('DB01156', 'DOID:0050742'))
+
+# extract relevant information from each column (e.g., node and edge types)
+metapath_df = metapath_filter.withColumn('r1', col('r1').getField('edge_type')).withColumn('n1', col('n1').getField('entity_type')).withColumn('r2', col('r2').getField('edge_type'))
+
+# aggregate the dataframe by metapath and count how many paths there are per metapath
+metapath_df.groupby(['c','r1', 'n1', 'r2','d']).agg({'d':'count'}).withColumnRenamed('count(d)', 'number_of_paths').sort(desc('count(d)')).show()
+
+# COMMAND ----------
+
+metapath_filter.show()
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Step 3: Find a metapath
 # MAGIC 
-# MAGIC 1. Select a metapath: Compound-[binds]-(Gene)-[associated]-(Disease)
-# MAGIC 2. Select a compound/disease pair: bupropion (DB01156)/nicotine dependence (DOID:0050742)
-# MAGIC 2. Calculate all paths through that metapath for the specific pair
+# MAGIC 1. Select a metapath: e.g., Compound-[binds]-(Gene)-[associated]-(Disease)
+# MAGIC 
+# MAGIC 2. Select a compound/disease pair: e.g., bupropion (DB01156)/nicotine dependence (DOID:0050742)
+# MAGIC 
+# MAGIC 2. Extract all paths along the specified metapath, for the specified compound/disease pair
+# MAGIC 
 # MAGIC 3. Calculate DWPC
 # MAGIC 
 # MAGIC   3.1. Select the columns with '\_node' as a suffix
@@ -119,17 +161,29 @@ print(g)
 
 # MAGIC %md
 # MAGIC Helper functions below
-# MAGIC 1. metapaths_of_length_2 takes as input the elements along the path and returns a dataframe where each row represents a path along that metapath
+# MAGIC 1. metapaths_of_length_n (for n=2,3,4) takes as input the elements along the path and returns a dataframe where each row represents a path along that metapath
 # MAGIC 2. column_add takes as input two columns and returns their sum
 
 # COMMAND ----------
 
 # helper functions/dataframes
 
-# this function calculated the paths along the specific metapath and returns them in a dataframe
-def metapaths_of_length_2(start_node, r1, middle_node, r2, end_node):
-  motifs = g.find("(start_node)-[r1]->(middle_node); (middle_node)-[r2]->(end_node)") 
-  metapaths_df = motifs.filter("start_node.identifier ='{}' and r1.edge_type = '{}' and middle_node.entity_type='{}' and r2.edge_type='{}' and end_node.identifier='{}'".format(start_node, r1, middle_node, r2, end_node))
+# this function calculates the paths along the specific metapath and returns them in a dataframe, each column represents an element along the path - node or edge
+def metapaths_of_length_2(compound, r1, n1, r2, disease):  
+  motifs = g.find("(compound)-[r1]->(n1); (n1)-[r2]->(disease)") 
+  metapaths_df = motifs.filter("compound.identifier ='{}' and r1.edge_type = '{}' and n1.entity_type='{}' and r2.edge_type='{}' and disease.identifier='{}'".format(compound, r1, n1, r2, disease))
+  return metapaths_df
+
+# metapaths of length 3
+def metapaths_of_length_3(compound, r1, n1, r2, n2, r3, disease):  
+  motifs = g.find("(compound)-[r1]->(n1); (n1)-[r2]->(n2); (n2)-[r3]->(disease)") 
+  metapaths_df = motifs.filter("compound.identifier ='{}' and r1.edge_type = '{}' and n1.entity_type='{}' and r2.edge_type='{}' and n2.entity_type='{}' and r3.edge_type='{}' and disease.identifier='{}'".format(compound, r1, n1, r2, n2, r3, disease))
+  return metapaths_df
+
+# metapaths of length 4
+def metapaths_of_length_4(compound, r1, n1, r2, n2, r3, n3, r4, disease):  
+  motifs = g.find("(compound)-[r1]->(n1); (n1)-[r2]->(n2); (n2)-[r3]->(n3); (n3)-[r4]-(disease)") 
+  metapaths_df = motifs.filter("compound.identifier ='{}' and r1.edge_type = '{}' and n1.entity_type='{}' and r2.edge_type='{}' and n2.entity_type='{}' and r3.edge_type='{}' and n3.entity_type='{}' and r3.edge_type='{}' and disease.identifier='{}'".format(compound, r1, n1, r2, n2, r3, n3, r4, disease))
   return metapaths_df
 
 # this function is for when I want to add all the columns for the pdp
@@ -146,12 +200,12 @@ node_degrees = g.inDegrees
 
 # COMMAND ----------
 
-# this function takes as input a dataframe th specified metapath (each element of the metapath is an input) along with a dataframe of the in-degrees of each node
+# this function takes as input the specified metapath (each element of the metapath is an input) along with a dataframe of the in-degrees of each node
 
-def dwpc_2(start_node, r1, middle_node, r2, end_node, degrees_df):
-  
+def dwpc_2(compound, r1, n1, r2, disease, degrees_df):
+
   # step 0: calculate metapath dataframe  
-  df = metapaths_of_length_2(start_node, r1, middle_node, r2, end_node)
+  df = metapaths_of_length_2(compound, r1, n1, r2, disease)
   
   # step 1: keep node columns
   condition = lambda col: '_node' not in col
@@ -173,10 +227,10 @@ def dwpc_2(start_node, r1, middle_node, r2, end_node, degrees_df):
   pdp_df = df.withColumn('pdp', reduce(column_add, (df[col] for col in df.columns)))
   
   # step 5: replace start_node and end_node columns with their appropriate ids
-  pdp_df = pdp_df.withColumn('start_node', lit(start_node)).withColumn('end_node', lit(end_node))
+  pdp_df = pdp_df.withColumn('compound', lit(start_node)).withColumn('disease', lit(end_node))
   
   # step 6: group by start_node and end_node to obtain DWPC
-  dwpc_df = pdp_df.groupby(['start_node', 'end_node']).agg({'pdp':'sum'}).withColumnRenamed('sum(pdp)', 'dwpc')
+  dwpc_df = pdp_df.groupby(['compound', 'disease']).agg({'pdp':'sum'}).withColumnRenamed('sum(pdp)', 'dwpc')
   
   return dwpc_df
 
