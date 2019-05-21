@@ -53,20 +53,22 @@ nodes = nodes.selectExpr('id as id', 'identifiers as identifier', 'labels as des
 # load edge csv + rename columns
 edges_original = read_from_azure_blob("hetio_edges")
 edges_original = edges_original.selectExpr('src as src', 'dst as dst', 'type as edge_type')
-edges_original.count()
+
+print('There are {} edges in the original Het.io graph'.format(edges_original.count()))
 
 # COMMAND ----------
 
 # The number of unique compounds in the graph
-nodes.filter("entity_type = 'Compound'").select(col('identifier')).count()
+print('There are {} unique compounds in the Het.io graph.'.format(nodes.filter("entity_type = 'Compound'").select(col('identifier')).count()))
 
 # COMMAND ----------
 
 # The number of unique diseases in the graph
-nodes.filter("entity_type = 'Disease'").select(col('identifier')).count()
+print('There are {} unique diseases in the Het.io graph.'.format(nodes.filter("entity_type = 'Disease'").select(col('identifier')).count()))
 
 # COMMAND ----------
 
+# total number of compound/disease pairs - not all are used in the Rephetio analysis
 1552*137
 
 # COMMAND ----------
@@ -79,12 +81,11 @@ nodes.filter("entity_type = 'Disease'").select(col('identifier')).count()
 # MAGIC %md
 # MAGIC ## Step 1: Create bi-directional edges
 # MAGIC 
-# MAGIC In the original het.io graph, each edge represents a bidrectional relationship. GraphFrames does not accept undirected relationships so it thinks that each edge I have put in the edges dataframe, is a directed one. I will add the opposite edge to the dataframe so that I can then calculate paths. 
+# MAGIC In the original het.io graph, each edge represents a bidrectional relationship. GraphFrames does not accept undirected relationships and takes the src column as originating node and the dst column as destination node. I will add the opposite edge to the dataframe so that I can then calculate the metapaths. 
 
 # COMMAND ----------
 
-edges_temp = edges_original
-edges_extra = edges_temp.selectExpr('dst as src', 'src as dst', 'edge_type as edge_type')
+edges_extra = edges_original.selectExpr('dst as src', 'src as dst', 'edge_type as edge_type')
 
 # append edges_extra to edges
 import functools
@@ -112,34 +113,9 @@ print(g)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC The following extracts all the metapaths of length 3 for a specified compound/disease pair
-
-# COMMAND ----------
-
-g_original = GraphFrame(nodes, edges_original)
-
-# metapaths of length 2
-metapath = g_original.find("(c)-[r1]->(n1); (n1)-[r2]->(d)")
-
-# filter for the specific compound and disease
-metapath_filter = metapath.filter("c.identifier ='{}' and d.identifier='{}'".format('DB01156', 'DOID:0050742'))
-
-# extract relevant information from each column (e.g., node and edge types)
-metapath_df = metapath_filter.withColumn('r1', col('r1').getField('edge_type')).withColumn('n1', col('n1').getField('entity_type')).withColumn('r2', col('r2').getField('edge_type'))
-
-# aggregate the dataframe by metapath and count how many paths there are per metapath
-metapath_df.groupby(['c','r1', 'n1', 'r2','d']).agg({'d':'count'}).withColumnRenamed('count(d)', 'number_of_paths').sort(desc('count(d)')).show()
-
-# COMMAND ----------
-
-metapath_filter.show()
-
-# COMMAND ----------
-
-# MAGIC %md
 # MAGIC ## Step 3: Find a metapath
 # MAGIC 
-# MAGIC 1. Select a metapath: e.g., Compound-[binds]-(Gene)-[associated]-(Disease)
+# MAGIC 1. Select a metapath: e.g., Compound-[binds]-(Gene)-[associates]-(Disease)
 # MAGIC 
 # MAGIC 2. Select a compound/disease pair: e.g., bupropion (DB01156)/nicotine dependence (DOID:0050742)
 # MAGIC 
@@ -166,24 +142,22 @@ metapath_filter.show()
 
 # COMMAND ----------
 
-# helper functions/dataframes
-
 # this function calculates the paths along the specific metapath and returns them in a dataframe, each column represents an element along the path - node or edge
-def metapaths_of_length_2(compound, r1, n1, r2, disease):  
-  motifs = g.find("(compound)-[r1]->(n1); (n1)-[r2]->(disease)") 
-  metapaths_df = motifs.filter("compound.identifier ='{}' and r1.edge_type = '{}' and n1.entity_type='{}' and r2.edge_type='{}' and disease.identifier='{}'".format(compound, r1, n1, r2, disease))
+def metapaths_of_length_2(start_node, r1, middle1_node, r2, end_node):  
+  motifs = g.find("(start_node)-[r1]->(middle1_node); (middle1_node)-[r2]->(end_node)") 
+  metapaths_df = motifs.filter("start_node.identifier ='{}' and r1.edge_type = '{}' and middle1_node.entity_type='{}' and r2.edge_type='{}' and end_node.identifier='{}'".format(start_node, r1, middle1_node, r2, end_node))
   return metapaths_df
 
 # metapaths of length 3
-def metapaths_of_length_3(compound, r1, n1, r2, n2, r3, disease):  
-  motifs = g.find("(compound)-[r1]->(n1); (n1)-[r2]->(n2); (n2)-[r3]->(disease)") 
-  metapaths_df = motifs.filter("compound.identifier ='{}' and r1.edge_type = '{}' and n1.entity_type='{}' and r2.edge_type='{}' and n2.entity_type='{}' and r3.edge_type='{}' and disease.identifier='{}'".format(compound, r1, n1, r2, n2, r3, disease))
+def metapaths_of_length_3(start_node, r1, middle1_node, r2, middle2_node, r3, end_node):  
+  motifs = g.find("(start_node)-[r1]->(middle1_node); (middle1_node)-[r2]->(middle2_node); (middle2_node)-[r3]->(end_node)") 
+  metapaths_df = motifs.filter("start_node.identifier ='{}' and r1.edge_type = '{}' and middle1_node.entity_type='{}' and r2.edge_type='{}' and middle2_node.entity_type='{}' and r3.edge_type='{}' and end_node.identifier='{}'".format(start_node, r1, middle1_node, r2, middle2_node, r3, end_node))
   return metapaths_df
 
 # metapaths of length 4
-def metapaths_of_length_4(compound, r1, n1, r2, n2, r3, n3, r4, disease):  
-  motifs = g.find("(compound)-[r1]->(n1); (n1)-[r2]->(n2); (n2)-[r3]->(n3); (n3)-[r4]-(disease)") 
-  metapaths_df = motifs.filter("compound.identifier ='{}' and r1.edge_type = '{}' and n1.entity_type='{}' and r2.edge_type='{}' and n2.entity_type='{}' and r3.edge_type='{}' and n3.entity_type='{}' and r3.edge_type='{}' and disease.identifier='{}'".format(compound, r1, n1, r2, n2, r3, n3, r4, disease))
+def metapaths_of_length_4(start_node, r1, middle1_node, r2, middle2_node, r3, middle3_node, r4, end_node):  
+  motifs = g.find("(start_node)-[r1]->(middle1_node); (middle1_node)-[r2]->(middle2_node); (middle2_node)-[r3]->(middle3_node); (middle3_node)-[r4]-(end_node)") 
+  metapaths_df = motifs.filter("start_node.identifier ='{}' and r1.edge_type = '{}' and middle1_node.entity_type='{}' and r2.edge_type='{}' and middle2_node.entity_type='{}' and r3.edge_type='{}' and middle3_node.entity_type='{}' and r3.edge_type='{}' and end_node.identifier='{}'".format(start_node, r1, middle1_node, r2, middle2_node, r3, middle3_node, r4, end_node))
   return metapaths_df
 
 # this function is for when I want to add all the columns for the pdp
@@ -192,6 +166,38 @@ def column_add(a,b):
   
 # dataframe of in-degrees - this should correspond to the original het.io degrees for each node
 node_degrees = g.inDegrees
+node_degrees_converted = broadcast(node_degrees.withColumn('degree_converted', col('inDegree')**-0.4).drop(col('inDegree')))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Broadcasting the node degrees dataframe so I can access it in the UDF which calculates the DWPC
+
+# COMMAND ----------
+
+# dataframe of in-degrees - this should correspond to the original het.io degrees for each node
+node_degrees = g.inDegrees
+node_degrees_converted = broadcast(node_degrees.withColumn('degree_converted', col('inDegree')**-0.4).drop(col('inDegree')))
+display(node_degrees_converted)
+
+# COMMAND ----------
+
+# calculating all metapaths of length two for a given compound/disease
+df = metapaths_of_length_2('DB01156', 'binds', 'Gene', 'associates', 'DOID:0050742')
+
+# step 1: keep node columns
+condition = lambda col: '_node' not in col
+df = df.drop(*filter(condition, df.columns))
+  
+# step 2: only keep 'id' value in each column
+for c in df.columns:
+  df = df.withColumn(c, col(c).getField('id'))
+  
+display(df)  
+
+# COMMAND ----------
+
+
 
 # COMMAND ----------
 
@@ -202,10 +208,10 @@ node_degrees = g.inDegrees
 
 # this function takes as input the specified metapath (each element of the metapath is an input) along with a dataframe of the in-degrees of each node
 
-def dwpc_2(compound, r1, n1, r2, disease, degrees_df):
+def dwpc_2(start_node, r1, middle1_node, r2, end_node):
 
   # step 0: calculate metapath dataframe  
-  df = metapaths_of_length_2(compound, r1, n1, r2, disease)
+  df = metapaths_of_length_2(start_node, r1, middle1_node, r2, end_node)
   
   # step 1: keep node columns
   condition = lambda col: '_node' not in col
@@ -215,32 +221,50 @@ def dwpc_2(compound, r1, n1, r2, disease, degrees_df):
   for c in df.columns:
     df = df.withColumn(c, col(c).getField('id'))
   
-  # step 3: Get the degrees and multiply by 1**-0.4. Probably a much better way of doing this... 
+  # step 3: Get the degrees which have already been multiplied by 1**-0.4. Probably a much better way of doing this... 
   columns = df.columns
   for c in columns:
     temp1 = df.withColumnRenamed(c, 'id')
-    temp2 = temp1.join(node_degrees, 'id')
-    temp3 = temp2.withColumnRenamed('inDegree', c).drop('id').withColumn(c, col(c)**-0.4) 
+    temp2 = temp1.join(node_degrees_converted, 'id')
+    temp3 = temp2.withColumnRenamed('degree_converted', c).drop('id').withColumn(c, col(c)) 
     df = temp3
 
   # step 4: sum all the columns to obtain the pdp
   pdp_df = df.withColumn('pdp', reduce(column_add, (df[col] for col in df.columns)))
   
-  # step 5: replace start_node and end_node columns with their appropriate ids
-  pdp_df = pdp_df.withColumn('compound', lit(start_node)).withColumn('disease', lit(end_node))
+  # step 5: replace start_node and end_node columns with their corresponding ids
+  pdp_df = pdp_df.withColumn('start_node', lit(start_node)).withColumn('end_node', lit(end_node))
   
   # step 6: group by start_node and end_node to obtain DWPC
-  dwpc_df = pdp_df.groupby(['compound', 'disease']).agg({'pdp':'sum'}).withColumnRenamed('sum(pdp)', 'dwpc')
+  dwpc_df = pdp_df.groupby(['start_node', 'end_node']).agg({'pdp':'sum'}).withColumnRenamed('sum(pdp)', 'dwpc').drop('start_node', 'end_node')
   
   return dwpc_df
 
 # COMMAND ----------
 
-dwpc_2('DB01156', 'binds', 'Gene', 'associates', 'DOID:0050742', node_degrees).show()
+dwpc_2('DB01156', 'binds', 'Gene', 'associates', 'DOID:0050742').show()
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ## Step 4: Calculate DWPC for ALL metapaths of length 2
+# MAGIC 
+# MAGIC This is for the specific compound/disease pair Bupropion and Nicotine dependence
+
+# COMMAND ----------
+
+# load three csvs with metapaths  
+mp2 = read_from_azure_blob("db01156_doid0050742_metapaths2")
+mp3 = read_from_azure_blob("db01156_doid0050742_metapaths3")
+mp4 = read_from_azure_blob("db01156_doid0050742_metapaths4")
+
+print('There are {} metapaths of length {}'.format(mp2.count(), 2))
 
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC Next step is to figure out how to iterate over the metapaths for a specific compound and produce the DWPC for each one. The perfect setting for this is a UDF, where I iterate over each row of the dataframe mp2, and add a new column called DWPC. This would then be a dataframe representing all metapaths of length 2 and their corresponding DWPC for a specified compound and disease pair. 
+# MAGIC 
+# MAGIC The main issue is: To be able to calculate the DWPC I need the degree of each node. However I cannot pass a dataframe to a UDF. I also cannot perform a join *beforehand* because it is only after I get the row from the dataframe, that I need to node_degrees dataframe.
+# MAGIC   - I tried making a broadcast variable out of the node_degrees dataframe and then referencing it from inside the UDF (without passing it in the UDF) but this did not work
